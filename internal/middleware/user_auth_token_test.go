@@ -74,6 +74,10 @@ func (s *fakeMiddlewareTokenService) GetRecentClients(ctx context.Context, uid i
 	return nil, nil
 }
 
+func (s *fakeMiddlewareTokenService) CleanExpired(ctx context.Context, uid int64, issueType int) error {
+	return nil
+}
+
 func newMiddlewareJWT(t *testing.T, secretKey, nonce string) string {
 	t.Helper()
 	tokenManager := app.NewTokenManager(app.TokenConfig{
@@ -105,6 +109,9 @@ func runUserAuthMiddlewareWithRequest(t *testing.T, tokenService *fakeMiddleware
 		c.JSON(http.StatusOK, gin.H{"code": code.Success.Code(), "status": true})
 	})
 	router.POST("/api/file", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"code": code.Success.Code(), "status": true})
+	})
+	router.GET("/api/vault", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"code": code.Success.Code(), "status": true})
 	})
 
@@ -187,6 +194,40 @@ func TestUserAuthTokenWithConfig_RejectsScopeRestrictedToken(t *testing.T) {
 
 	assert.Equal(t, code.ErrorAuthTokenScopeRestricted.Code(), res.Code)
 	assert.Contains(t, res.Details, "Permission denied")
+}
+
+func TestUserAuthTokenWithConfig_AllowsVaultListWithNoteReadScope(t *testing.T) {
+	token := newMiddlewareJWT(t, "test-secret", "nonce-ok")
+	res := runUserAuthMiddlewareWithRequest(t, &fakeMiddlewareTokenService{activeToken: &domain.AuthToken{
+		ID:          2,
+		UID:         1,
+		TokenString: "nonce-ok",
+		Status:      1,
+		Scope:       "p:rest c:ObsidianPlugin f:note_r",
+		IssueType:   2,
+		ExpiredAt:   time.Now().Add(time.Hour),
+	}}, token, http.MethodGet, "/api/vault", func(req *http.Request) {
+		req.Header.Set("x-client", "ObsidianPlugin")
+	})
+
+	assert.Equal(t, code.Success.Code(), res.Code)
+}
+
+func TestUserAuthTokenWithConfig_RejectsVaultListWithoutNoteReadScope(t *testing.T) {
+	token := newMiddlewareJWT(t, "test-secret", "nonce-ok")
+	res := runUserAuthMiddlewareWithRequest(t, &fakeMiddlewareTokenService{activeToken: &domain.AuthToken{
+		ID:          2,
+		UID:         1,
+		TokenString: "nonce-ok",
+		Status:      1,
+		Scope:       "p:rest c:ObsidianPlugin f:file_r",
+		IssueType:   2,
+		ExpiredAt:   time.Now().Add(time.Hour),
+	}}, token, http.MethodGet, "/api/vault", func(req *http.Request) {
+		req.Header.Set("x-client", "ObsidianPlugin")
+	})
+
+	assert.Equal(t, code.ErrorAuthTokenScopeRestricted.Code(), res.Code)
 }
 
 func TestUserAuthTokenWithConfig_AllowsLoginTokenWithoutClientHeader(t *testing.T) {
