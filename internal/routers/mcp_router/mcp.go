@@ -69,11 +69,13 @@ func NewMCPHandler(appContainer *app.App, wss *pkgapp.WebsocketServer) *MCPHandl
 	}
 
 	srv := NewMCPServer(appContainer, wss)
+	sseLocalhostOption, streamableLocalhostOption := mcpLocalhostProtectionOptions(cfg.Server.MCPDisableLocalhostProtection)
 
 	sseOptions := []mcpserver.SSEOption{
 		mcpserver.WithMessageEndpoint("/api/mcp/message"),
 		mcpserver.WithKeepAlive(true),
 		mcpserver.WithKeepAliveInterval(pingInterval),
+		sseLocalhostOption,
 		mcpserver.WithSSEContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			if val := r.Context().Value("uid"); val != nil {
 				ctx = context.WithValue(ctx, "uid", val)
@@ -89,6 +91,7 @@ func NewMCPHandler(appContainer *app.App, wss *pkgapp.WebsocketServer) *MCPHandl
 	// StreamableHTTP server shares the same MCPServer instance as SSEServer.
 	// StreamableHTTP 服务与 SSEServer 共享同一 MCPServer 实例。
 	streamableOptions := []mcpserver.StreamableHTTPOption{
+		streamableLocalhostOption,
 		mcpserver.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			// uid is pre-injected into the request context by HandleStreamableHTTP
 			// before calling ServeHTTP, so we forward it here.
@@ -112,6 +115,10 @@ func NewMCPHandler(appContainer *app.App, wss *pkgapp.WebsocketServer) *MCPHandl
 		extApiUrl:        strings.TrimSuffix(cfg.Server.ExtApiUrl, "/"),
 		cfg:              cfg,
 	}
+}
+
+func mcpLocalhostProtectionOptions(disable bool) (mcpserver.SSEOption, mcpserver.StreamableHTTPOption) {
+	return mcpserver.WithSSEDisableLocalhostProtection(disable), mcpserver.WithDisableLocalhostProtection(disable)
 }
 
 func (h *MCPHandler) HandleSSE(c *gin.Context) {

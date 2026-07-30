@@ -51,3 +51,16 @@ user-database:
 	require.True(t, *cfg.Storage.AwsS3.IsEnabled)
 	require.True(t, *cfg.Storage.MinIO.IsEnabled)
 }
+
+func TestLoadConfigMCPDisableLocalhostProtection(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	err := os.WriteFile(configPath, []byte(`
+server:
+  mcp-disable-localhost-protection: true
+`), 0644)
+	require.NoError(t, err)
+
+	cfg, _, err := LoadConfig(configPath)
+	require.NoError(t, err)
+	require.True(t, cfg.Server.MCPDisableLocalhostProtection)
+}

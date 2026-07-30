@@ -17,6 +17,13 @@ server:
   # SSE 保活心跳间隔（秒）
   # MCP SSE ping interval (seconds)
   mcp-sse-ping-interval: 30
+  # 是否关闭 MCP 的 localhost DNS 重绑定保护。默认 false。
+  # 仅当可信的本机反向代理或 Cloudflare Tunnel 通过 127.0.0.1 连接、同时保留公网 Host 请求头时才开启。
+  # 开启前请确保 MCP 端口不直接暴露给不可信的本地客户端。
+  # Whether to disable MCP localhost DNS rebinding protection. Defaults to false.
+  # Enable only when a trusted local reverse proxy or Cloudflare Tunnel connects through 127.0.0.1 while preserving the public Host header.
+  # Before enabling, ensure the MCP port is not directly exposed to untrusted local clients.
+  mcp-disable-localhost-protection: false
   # 独立 Web 界面端口。留空则不开启。格式: :port
   # Independent WebGUI port. Leave empty to disable. Format: :port
   webgui-port: ""
@@ -518,4 +525,3 @@ attachment-static:
     # - ".jpeg"
     # - ".gif"
     # - ".pdf"
-
