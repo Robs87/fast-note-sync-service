@@ -109,6 +109,151 @@ func TestBackupService_GetConfigs_Empty(t *testing.T) {
 	backupRepo.AssertExpectations(t)
 }
 
+// TestBackupService_GetConfigs_ReconcilesStaleSuccess verifies that a stale
+// last_status=Success (e.g. written by an older version that swallowed upload errors)
+// is corrected to Failed from the latest run's history records, and the correction is
+// persisted so the database self-heals.
+// TestBackupService_GetConfigs_ReconcilesStaleSuccess 验证旧的错误"成功"状态会依据最近
+// 一次运行的历史记录被纠正为"失败"，并将纠正结果回写数据库。
+func TestBackupService_GetConfigs_ReconcilesStaleSuccess(t *testing.T) {
+	backupRepo := new(domainmocks.MockBackupRepository)
+	vaultRepo := new(domainmocks.MockVaultRepository)
+	storageSvc := &backupStorageStub{}
+
+	runTime := time.Date(2026, 8, 1, 19, 33, 14, 0, time.Local)
+	configs := []*domain.BackupConfig{
+		{
+			ID:          1,
+			UID:         1,
+			Type:        "full",
+			IsEnabled:   true,
+			LastRunTime: runTime,
+			LastStatus:  domain.BackupStatusSuccess, // stale value written by old version
+			LastMessage: "Backup completed successfully",
+		},
+	}
+	backupRepo.On("ListConfigs", mock.Anything, int64(1)).Return(configs, nil)
+	backupRepo.On("ListHistory", mock.Anything, int64(1), int64(1), int(1), int(100)).Return(
+		[]*domain.BackupHistory{
+			{
+				ID:        2,
+				ConfigID:  1,
+				UID:       1,
+				StorageID: 1,
+				StartTime: runTime,
+				Status:    domain.BackupStatusFailed,
+				Message:   "Invalid R2 AccountID: AccountID is empty.",
+			},
+		}, int64(1), nil,
+	)
+	backupRepo.On("SaveConfig", mock.Anything, mock.MatchedBy(func(c *domain.BackupConfig) bool {
+		return c.ID == 1 && c.LastStatus == domain.BackupStatusFailed &&
+			c.LastMessage == "Backup failed: Invalid R2 AccountID: AccountID is empty."
+	}), int64(1)).Return(configs[0], nil)
+
+	svc := newBackupSvc(backupRepo, vaultRepo, storageSvc)
+	result, err := svc.GetConfigs(context.Background(), 1)
+
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, domain.BackupStatusFailed, result[0].LastStatus)
+	assert.Contains(t, result[0].LastMessage, "Invalid R2 AccountID")
+	backupRepo.AssertExpectations(t)
+}
+
+// TestBackupService_GetConfigs_KeepsEarlyFailure verifies that when the current run
+// failed before creating any history record, the persisted Failed status is kept instead
+// of being overwritten by an older run's history.
+// TestBackupService_GetConfigs_KeepsEarlyFailure 验证本次运行在产生历史记录前失败时，
+// 保留 finishTask 写入的"失败"状态，不会被更早一次运行的历史覆盖。
+func TestBackupService_GetConfigs_KeepsEarlyFailure(t *testing.T) {
+	backupRepo := new(domainmocks.MockBackupRepository)
+	vaultRepo := new(domainmocks.MockVaultRepository)
+	storageSvc := &backupStorageStub{}
+
+	oldRunTime := time.Date(2026, 8, 1, 18, 0, 0, 0, time.Local)
+	currentRunTime := time.Date(2026, 8, 1, 19, 0, 0, 0, time.Local)
+	configs := []*domain.BackupConfig{
+		{
+			ID:          1,
+			UID:         1,
+			Type:        "full",
+			IsEnabled:   true,
+			LastRunTime: currentRunTime,
+			LastStatus:  domain.BackupStatusFailed,
+			LastMessage: "Backup failed: zip failed",
+		},
+	}
+	backupRepo.On("ListConfigs", mock.Anything, int64(1)).Return(configs, nil)
+	backupRepo.On("ListHistory", mock.Anything, int64(1), int64(1), int(1), int(100)).Return(
+		[]*domain.BackupHistory{
+			{
+				ID:        1,
+				ConfigID:  1,
+				UID:       1,
+				StorageID: 1,
+				StartTime: oldRunTime,
+				Status:    domain.BackupStatusSuccess,
+				Message:   "Success",
+			},
+		}, int64(1), nil,
+	)
+
+	svc := newBackupSvc(backupRepo, vaultRepo, storageSvc)
+	result, err := svc.GetConfigs(context.Background(), 1)
+
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, domain.BackupStatusFailed, result[0].LastStatus)
+	assert.Equal(t, "Backup failed: zip failed", result[0].LastMessage)
+	backupRepo.AssertExpectations(t)
+}
+
+// TestBackupService_GetConfigs_NoRewriteWhenConsistent verifies that when the persisted
+// status already matches the latest history run, no correction write is performed.
+// TestBackupService_GetConfigs_NoRewriteWhenConsistent 验证持久化状态与最新历史一致时，
+// 不会执行任何纠正写入。
+func TestBackupService_GetConfigs_NoRewriteWhenConsistent(t *testing.T) {
+	backupRepo := new(domainmocks.MockBackupRepository)
+	vaultRepo := new(domainmocks.MockVaultRepository)
+	storageSvc := &backupStorageStub{}
+
+	runTime := time.Date(2026, 8, 1, 19, 33, 14, 0, time.Local)
+	configs := []*domain.BackupConfig{
+		{
+			ID:          1,
+			UID:         1,
+			Type:        "full",
+			IsEnabled:   true,
+			LastRunTime: runTime,
+			LastStatus:  domain.BackupStatusFailed,
+			LastMessage: "Backup failed: archive errors",
+		},
+	}
+	backupRepo.On("ListConfigs", mock.Anything, int64(1)).Return(configs, nil)
+	backupRepo.On("ListHistory", mock.Anything, int64(1), int64(1), int(1), int(100)).Return(
+		[]*domain.BackupHistory{
+			{
+				ID:        2,
+				ConfigID:  1,
+				UID:       1,
+				StorageID: 1,
+				StartTime: runTime,
+				Status:    domain.BackupStatusFailed,
+				Message:   "archive errors",
+			},
+		}, int64(1), nil,
+	)
+
+	svc := newBackupSvc(backupRepo, vaultRepo, storageSvc)
+	result, err := svc.GetConfigs(context.Background(), 1)
+
+	assert.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, domain.BackupStatusFailed, result[0].LastStatus)
+	backupRepo.AssertExpectations(t)
+}
+
 // --- UpdateConfig ---
 
 // TestBackupService_UpdateConfig_Success verifies config is saved with resolved vault ID.
