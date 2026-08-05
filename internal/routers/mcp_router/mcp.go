@@ -253,6 +253,23 @@ func (h *MCPHandler) HandleMessage(c *gin.Context) {
 // It accepts POST (request/notification), GET (SSE listening), and DELETE (session termination).
 // HandleStreamableHTTP 处理 MCP StreamableHTTP 传输协议。
 // 支持 POST（请求/通知）、GET（SSE 监听）和 DELETE（终止会话）。
+//
+// Session-invalid recovery:
+// mark3labs/mcp-go's StreamableHTTPServer returns HTTP 404 "Invalid session ID"
+// when the client's Mcp-Session-Id header is missing or the in-memory session was
+// evicted (e.g. under concurrent load / long-lived clients that lost their session).
+// Clients are not expected to recover from a transport-level 404 by themselves, so
+// we transparently rewrite such responses: when the request is a non-initialize POST
+// and mcp-go rejected it with 404, we buffer the response and, if the body indicates
+// an invalid/terminated session, return a JSON-RPC error instead so well-behaved
+// MCP clients can re-initialize and retry. The original 404 is preserved for GET/DELETE.
+//
+// Session 失效自动恢复:
+// mcp-go 的 StreamableHTTPServer 在客户端 Mcp-Session-Id 头缺失或内存会话被淘汰时
+// （如并发负载下、长连接客户端会话丢失）会返回 HTTP 404 "Invalid session ID"。
+// 客户端通常无法自行从传输层 404 恢复，因此这里对非 initialize 的 POST 请求做透明改写：
+// 缓冲响应，若 body 表明会话无效/已终止，则改为返回 JSON-RPC 错误，让符合规范的
+// MCP 客户端可以重新 initialize 并重试。GET/DELETE 请求保持原始 404 语义。
 func (h *MCPHandler) HandleStreamableHTTP(c *gin.Context) {
 	uid := pkgapp.GetUID(c)
 	// Pre-inject uid into the request context so that WithHTTPContextFunc can forward it.
@@ -264,5 +281,64 @@ func (h *MCPHandler) HandleStreamableHTTP(c *gin.Context) {
 	if vaults, ok := c.Get("vaults"); ok {
 		ctx = context.WithValue(ctx, "vaults", vaults)
 	}
-	h.streamableServer.ServeHTTP(c.Writer, c.Request.WithContext(ctx))
+
+	if c.Request.Method == http.MethodPost && c.GetHeader(HeaderKeySessionID) == "" {
+		// No session header at all: let mcp-go handle it (initialize will generate one).
+		// 完全没有 session 头：交给 mcp-go 处理（initialize 会生成新会话）。
+		h.streamableServer.ServeHTTP(c.Writer, c.Request.WithContext(ctx))
+		return
+	}
+
+	// Wrap the response writer to detect session-invalid 404s on POST and convert
+	// them into a JSON-RPC error the client can recover from.
+	// 包装响应写入器，检测 POST 请求上的 session 无效 404，并转换为客户端可恢复的 JSON-RPC 错误。
+	rec := &sessionRecoveryWriter{ResponseWriter: c.Writer, status: http.StatusOK}
+	h.streamableServer.ServeHTTP(rec, c.Request.WithContext(ctx))
+
+	if rec.status == http.StatusNotFound && c.Request.Method == http.MethodPost && rec.isJSONRPC {
+		// mcp-go rejected the request because the session is unknown/invalid.
+		// Return a JSON-RPC error with a clear code so clients can re-initialize.
+		// mcp-go 因会话未知/无效拒绝了请求。返回带明确错误码的 JSON-RPC 错误，客户端可重新初始化。
+		body := `{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"MCP session not found or invalid. Re-initialize the session and retry.","data":{"retryable":true}}}`
+		c.Header("Content-Type", "application/json")
+		c.Writer.WriteHeader(http.StatusOK)
+		_, _ = c.Writer.Write([]byte(body))
+		return
+	}
+
+	// Non-404 responses were already written by mcp-go (including error bodies).
+	// 非 404 响应已由 mcp-go 写入（含错误体）。
+}
+
+// HeaderKeySessionID mirrors mcp-go's session header key without importing it here.
+// 与 mcp-go 的会话头键保持一致（避免额外导入）。
+const HeaderKeySessionID = "Mcp-Session-Id"
+
+// sessionRecoveryWriter buffers the status and inspects whether the body is JSON-RPC,
+// so HandleStreamableHTTP can detect transport-level session rejection (HTTP 404).
+// sessionRecoveryWriter 记录响应状态并检查 body 是否为 JSON-RPC，
+// 以便 HandleStreamableHTTP 识别传输层的会话拒绝（HTTP 404）。
+type sessionRecoveryWriter struct {
+	http.ResponseWriter
+	status    int
+	isJSONRPC bool
+}
+
+func (w *sessionRecoveryWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *sessionRecoveryWriter) Write(data []byte) (int, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		w.isJSONRPC = true
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *sessionRecoveryWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
