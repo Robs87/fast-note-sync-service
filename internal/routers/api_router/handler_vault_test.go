@@ -106,6 +106,33 @@ func TestVaultHandler_List_Success(t *testing.T) {
 	mockSvc.AssertExpectations(t)
 }
 
+// TestVaultHandler_List_FiltersRestrictedVaults verifies token vault restrictions.
+// TestVaultHandler_List_FiltersRestrictedVaults 验证令牌的 Vault 限制会过滤列表。
+func TestVaultHandler_List_FiltersRestrictedVaults(t *testing.T) {
+	mockSvc := new(svcmocks.MockVaultService)
+	mockSvc.On("List", mock.Anything, int64(1)).
+		Return([]*dto.VaultDTO{
+			{ID: 1, Name: "Vault-A"},
+			{ID: 2, Name: "Vault-B"},
+		}, nil)
+
+	handler := newVaultHandler(mockSvc)
+	c, w := newVaultTestContext("GET", "/api/vault", "", 1)
+	c.Set("vaults", "Vault-B")
+	handler.List(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	result := decodeRes(t, w)
+	data, ok := result["data"].([]interface{})
+	assert.True(t, ok)
+	if assert.Len(t, data, 1) {
+		vault, vaultOK := data[0].(map[string]interface{})
+		assert.True(t, vaultOK)
+		assert.Equal(t, "Vault-B", vault["vault"])
+	}
+	mockSvc.AssertExpectations(t)
+}
+
 // TestVaultHandler_List_NoUID verifies that missing UID returns auth error.
 // TestVaultHandler_List_NoUID 验证未携带 UID 时返回认证错误。
 func TestVaultHandler_List_NoUID(t *testing.T) {
@@ -285,4 +312,3 @@ func TestVaultHandler_RebuildIndex_NoUID(t *testing.T) {
 	assertResponseCode(t, w, code.ErrorNotUserAuthToken.Code())
 	mockSvc.AssertExpectations(t)
 }
-

@@ -104,10 +104,11 @@ func AuthenticateUserToken(c *gin.Context, secretKey string, tokenService servic
 
 	path := c.Request.URL.Path
 	method := c.Request.Method
+	isRead := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 	var function string
 
 	var resource string
-	if strings.HasPrefix(path, "/api/note") || strings.HasPrefix(path, "/api/folder") {
+	if (path == "/api/vault" && isRead) || strings.HasPrefix(path, "/api/note") || strings.HasPrefix(path, "/api/folder") {
 		resource = "note"
 	} else if strings.HasPrefix(path, "/api/file") || strings.HasPrefix(path, "/api/storage") {
 		resource = "file"
@@ -116,7 +117,7 @@ func AuthenticateUserToken(c *gin.Context, secretKey string, tokenService servic
 	}
 
 	if resource != "" {
-		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+		if isRead {
 			function = resource + "_r"
 		} else {
 			function = resource + "_w"
