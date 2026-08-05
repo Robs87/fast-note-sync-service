@@ -27,10 +27,9 @@ type ServerConfig struct {
 	// ExtApiUrl external API URL
 	// ExtApiUrl external API URL
 	// ExtApiUrl 外部访问 API 的地址
-	ExtApiUrl string `yaml:"ext-api-url"`
+	ExtApiUrl          string   `yaml:"ext-api-url"`
 	CORSAllowedOrigins []string `yaml:"cors-allowed-origins"` // CORSAllowedOrigins allowed origins for CORS / CORSAllowedOrigins 跨域允许源白名单
-	TrustedProxies     []string `yaml:"trusted-proxies"`     // TrustedProxies trusted proxies IP/CIDR list / TrustedProxies 可信代理 IP/CIDR 列表
-
+	TrustedProxies     []string `yaml:"trusted-proxies"`      // TrustedProxies trusted proxies IP/CIDR list / TrustedProxies 可信代理 IP/CIDR 列表
 
 	// ShareBaseUrl external share page base URL
 	// ShareBaseUrl 外部分享页面基础 URL
@@ -38,6 +37,9 @@ type ServerConfig struct {
 	// MCPSSEPingInterval MCP SSE ping interval (seconds)
 	// MCPSSEPingInterval MCP SSE 保活心跳间隔（秒）
 	MCPSSEPingInterval int `yaml:"mcp-sse-ping-interval" default:"30"`
+	// MCPDisableLocalhostProtection disables MCP DNS rebinding protection for trusted loopback proxies
+	// MCPDisableLocalhostProtection 为可信的本机反向代理关闭 MCP DNS 重绑定保护
+	MCPDisableLocalhostProtection bool `yaml:"mcp-disable-localhost-protection"`
 	// CustomResponseHeaders custom response headers for all requests
 	// CustomResponseHeaders 所有请求的自定义响应头
 	CustomResponseHeaders map[string]string `yaml:"custom-response-headers"` // Custom response headers mapped to string
