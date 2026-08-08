@@ -404,6 +404,9 @@ func (s *backupService) calculateNextRunTime(config *domain.BackupConfig) {
 		expr = "0 0 1 * *" // Midnight 1st of month
 	case "custom":
 		expr = config.CronExpression
+	case "cron":
+		// 前端保存自定义 cron 表达式时写入该策略值，与 custom 行为一致
+		expr = config.CronExpression
 	}
 
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
