@@ -1,6 +1,6 @@
 module github.com/haierkeys/fast-note-sync-service
 
-go 1.26.2
+go 1.26
 
 require (
 	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.5.2
