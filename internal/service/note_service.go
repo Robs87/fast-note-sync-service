@@ -153,6 +153,7 @@ type noteService struct {
 	noteLinkRepo   domain.NoteLinkRepository  // Note link repository // 笔记链接仓库
 	fileRepo       domain.FileRepository      // File repository // 文件仓库
 	shareRepo      domain.UserShareRepository // Share repository for auto-revoke on delete // 分享仓库（删除时自动撤销）
+	historyRepo    domain.NoteHistoryRepository // Note history repository // 笔记历史仓库（rename 时迁移历史归属）
 	vaultService   VaultService               // Vault service // 仓库服务
 	folderService  FolderService              // Folder service // 文件夹服务
 	syncLogService SyncLogService             // Sync log service // 同步日志服务
@@ -169,13 +170,14 @@ type noteService struct {
 
 // NewNoteService creates NoteService instance
 // NewNoteService 创建 NoteService 实例
-func NewNoteService(userRepo domain.UserRepository, noteRepo domain.NoteRepository, noteLinkRepo domain.NoteLinkRepository, fileRepo domain.FileRepository, shareRepo domain.UserShareRepository, vaultSvc VaultService, folderSvc FolderService, backupSvc BackupService, gitSyncSvc GitSyncService, syncLogSvc SyncLogService, config *ServiceConfig) NoteService {
+func NewNoteService(userRepo domain.UserRepository, noteRepo domain.NoteRepository, noteLinkRepo domain.NoteLinkRepository, fileRepo domain.FileRepository, shareRepo domain.UserShareRepository, historyRepo domain.NoteHistoryRepository, vaultSvc VaultService, folderSvc FolderService, backupSvc BackupService, gitSyncSvc GitSyncService, syncLogSvc SyncLogService, config *ServiceConfig) NoteService {
 	return &noteService{
 		userRepo:       userRepo,
 		noteRepo:       noteRepo,
 		noteLinkRepo:   noteLinkRepo,
 		fileRepo:       fileRepo,
 		shareRepo:      shareRepo,
+		historyRepo:    historyRepo,
 		vaultService:   vaultSvc,
 		folderService:  folderSvc,
 		backupService:  backupSvc,
@@ -196,6 +198,7 @@ func (s *noteService) WithClient(clientType, name, version string) NoteService {
 		noteLinkRepo:   s.noteLinkRepo,
 		fileRepo:       s.fileRepo,
 		shareRepo:      s.shareRepo,
+		historyRepo:    s.historyRepo,
 		vaultService:   s.vaultService,
 		folderService:  s.folderService,
 		syncLogService: s.syncLogService,
@@ -1017,6 +1020,20 @@ func (s *noteService) Migrate(ctx context.Context, oldNoteID, newNoteID int64, u
 				zap.Int64("oldNoteID", oldNoteID),
 				zap.Int64("newNoteID", newNoteID),
 				zap.Error(shareErr))
+		}
+	}
+
+	// Migrate note history records: point all history versions of the old note ID to the new note ID
+	// Migrate note history records: point all history versions of the old note ID to the new note ID
+	// 迁移笔记历史记录：将旧笔记 ID 下的所有历史版本指向新笔记 ID
+	// （重命名前作者漏掉此迁移，导致重命名后历史版本丢失——回归修复）
+	if s.historyRepo != nil {
+		if err := s.historyRepo.Migrate(ctx, oldNoteID, newNoteID, uid); err != nil {
+			zap.L().Warn("Migrate: failed to migrate note history records",
+				zap.Int64(logger.FieldUID, uid),
+				zap.Int64("oldNoteID", oldNoteID),
+				zap.Int64("newNoteID", newNoteID),
+				zap.Error(err))
 		}
 	}
 
