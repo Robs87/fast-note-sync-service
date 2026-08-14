@@ -136,9 +136,114 @@ func (s *backupService) GetConfigs(ctx context.Context, uid int64) ([]*dto.Backu
 	}
 	var results []*dto.BackupConfigDTO
 	for _, c := range configs {
+		// Reconcile the last status from the actual last run's history records, so the
+		// API directly reflects the real task result even if the persisted last_status
+		// was written incorrectly by an older version.
+		// 用最近一次运行的历史记录校正 last_status/last_message，让接口直接返回上次
+		// 任务的真实结果，避免旧版本遗留的错误"成功"状态在 UI 上继续显示。
+		s.reconcileLastStatusFromHistory(ctx, c)
 		results = append(results, s.configToDTO(ctx, c))
 	}
 	return results, nil
+}
+
+// reconcileLastStatusFromHistory Corrects a config's persisted last status using the
+// history records of its most recent run. History is written per storage at the actual
+// moment of success/failure, so it is the authoritative record of what really happened.
+// Older versions could persist last_status=Success even when the run failed, and re-running
+// was the only way to repair it. With this correction the configs API always reflects the
+// true result of the last task without requiring a new execution.
+// 用最近一次运行的历史记录校正配置的 last_status。历史记录是按存储逐条写入的真实结果，
+// 比持久化的 last_status 更可信；旧版本可能把失败的运行写成"成功"，本方法可在读取时
+// 直接修正，无需再手动触发一次备份。
+func (s *backupService) reconcileLastStatusFromHistory(ctx context.Context, config *domain.BackupConfig) {
+	if config == nil || config.ID <= 0 || config.LastRunTime.IsZero() {
+		return
+	}
+
+	histories, _, err := s.backupRepo.ListHistory(ctx, config.UID, config.ID, 1, 100)
+	if err != nil || len(histories) == 0 {
+		return
+	}
+
+	// Find the start time of the most recent run that produced history records.
+	// 找出产生过历史记录的最近一次运行的开始时间。
+	latestStart := histories[0].StartTime
+	for _, h := range histories {
+		if h.StartTime.After(latestStart) {
+			latestStart = h.StartTime
+		}
+	}
+
+	// If the most recent history run is older than the recorded last run, the current
+	// run failed before creating any history record, so finishTask's status is authoritative.
+	// 若最新历史运行早于记录的 last_run_time，说明本次运行在产生历史记录前就失败了，
+	// 此时以 finishTask 写入的状态为准，不做覆盖。
+	if latestStart.Before(config.LastRunTime.Add(-time.Second)) {
+		return
+	}
+
+	var runRecords []*domain.BackupHistory
+	for _, h := range histories {
+		if h.StartTime.Equal(latestStart) {
+			runRecords = append(runRecords, h)
+		}
+	}
+	if len(runRecords) == 0 {
+		return
+	}
+
+	status, message := aggregateHistoryRunStatus(runRecords)
+	// Only rewrite when the status itself is wrong. If the status already matches, keep
+	// the existing message written by finishTask, which carries richer context.
+	// 仅当状态本身错误时才覆盖；状态一致时保留 finishTask 写入的、更完整的消息。
+	if status == config.LastStatus {
+		return
+	}
+
+	config.LastStatus = status
+	config.LastMessage = message
+
+	// Best-effort persistence so the database self-heals and stays consistent for every
+	// consumer (e.g. UpdateConfig preserving the corrected value).
+	// 尽力回写数据库完成自愈，保证其它消费方（如 UpdateConfig 保留状态）也能读到正确值。
+	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.backupRepo.SaveConfig(saveCtx, config, config.UID); err != nil {
+		s.logger.Warn("Failed to persist reconciled backup config status",
+			zap.Int64("configID", config.ID),
+			zap.Int("status", status),
+			zap.Error(err),
+		)
+	}
+}
+
+// aggregateHistoryRunStatus Derives the aggregate result of one backup run from its
+// per-storage history records, mirroring the priority used by finishTask:
+// stopped > failed > running > no-update > success.
+// 从一次运行的各存储历史记录推导聚合状态，优先级与 finishTask 保持一致。
+func aggregateHistoryRunStatus(records []*domain.BackupHistory) (int, string) {
+	for _, h := range records {
+		if h.Status == domain.BackupStatusStopped {
+			return domain.BackupStatusStopped, "Backup stopped by system"
+		}
+	}
+	for _, h := range records {
+		if h.Status == domain.BackupStatusFailed {
+			return domain.BackupStatusFailed, fmt.Sprintf("Backup failed: %s", h.Message)
+		}
+	}
+	for _, h := range records {
+		if h.Status == domain.BackupStatusRunning {
+			return domain.BackupStatusRunning, h.Message
+		}
+	}
+	for _, h := range records {
+		if h.Status == domain.BackupStatusNoUpdate {
+			return domain.BackupStatusNoUpdate, "Backup success, no updates found"
+		}
+	}
+	return domain.BackupStatusSuccess, "Backup completed successfully"
 }
 
 // UpdateConfig Update or create backup configuration
@@ -320,8 +425,8 @@ func (s *backupService) ExecuteUserBackup(ctx context.Context, uid int64, config
 	if !config.IsEnabled {
 		return code.ErrorBackupConfigDisabled
 	}
-	// Record error
-	// 记录错误
+	// Record error and propagate it back so the API layer can surface failures to the UI
+	// 记录错误并向上抛出，便于 API 层将失败状态展示到 UI（避免弹窗"假成功"）
 	if err := s.handleBackupSync(ctx, config, true); err != nil {
 		// Service shutdown errors bypass finishTask and are not persisted to history
 		if s.ctx.Err() != nil {
@@ -332,6 +437,7 @@ func (s *backupService) ExecuteUserBackup(ctx context.Context, uid int64, config
 			zap.Int64("configID", configID),
 			zap.Error(err),
 		)
+		return err
 	}
 	return nil
 }
@@ -595,19 +701,27 @@ func (s *backupService) runArchive(ctx context.Context, config *domain.BackupCon
 		return count, size, code.ErrorBackupStorageIDInvalid
 	}
 
+	var archiveErrors []string
 	for _, sid := range storageIds {
 		st, err := s.storageService.Get(ctx, uid, sid)
 		if err != nil {
 			s.logger.Warn("Failed to get storage config, skipping", zap.Int64("sid", sid), zap.Error(err))
+			archiveErrors = append(archiveErrors, fmt.Sprintf("storage %d: config error: %v", sid, err))
 			continue
 		}
 		if !st.IsEnabled {
 			s.logger.Info("Storage is disabled, skipping", zap.Int64("sid", sid))
 			continue
 		}
-		s.uploadArchive(ctx, uid, config.ID, st, zipPath, zipName, config.Type, password, startTime, count, size)
+		if err := s.uploadArchive(ctx, uid, config.ID, st, zipPath, zipName, config.Type, password, startTime, count, size); err != nil {
+			s.logger.Warn("Archive upload to storage failed", zap.Int64("sid", sid), zap.String("type", st.Type), zap.Error(err))
+			archiveErrors = append(archiveErrors, fmt.Sprintf("storage %d (%s): %v", sid, st.Type, err))
+		}
 	}
 
+	if len(archiveErrors) > 0 {
+		return count, size, fmt.Errorf("archive errors: %s", strings.Join(archiveErrors, "; "))
+	}
 	return count, size, nil
 }
 
@@ -797,8 +911,11 @@ func (s *backupService) exportArchiveFiles(ctx context.Context, uid, vaultID int
 }
 
 // uploadArchive Upload the archived ZIP file to specified storage target
+// Returns an error if upload (or any preceding step) fails so that callers can
+// aggregate per-storage failures and surface them to the API layer.
 // 将打包好的 ZIP 文件上传到指定的存储目标
-func (s *backupService) uploadArchive(ctx context.Context, uid, configId int64, stDTO *dto.StorageDTO, filePath, fileName, bType, password string, startTime time.Time, count, size int64) {
+// 当上传（或前置步骤）失败时返回 error，便于上层聚合各存储的失败信息并上报到 API 层
+func (s *backupService) uploadArchive(ctx context.Context, uid, configId int64, stDTO *dto.StorageDTO, filePath, fileName, bType, password string, startTime time.Time, count, size int64) error {
 	h := &domain.BackupHistory{
 		UID:       uid,
 		ConfigID:  configId,
@@ -815,29 +932,31 @@ func (s *backupService) uploadArchive(ctx context.Context, uid, configId int64, 
 	h, err := s.backupRepo.CreateHistory(ctx, h, uid)
 	if err != nil {
 		s.logger.Error("Failed to create backup history", zap.Error(err))
-		return
+		return fmt.Errorf("create backup history: %w", err)
 	}
 
 	client, err := s.getStorageClient(ctx, uid, stDTO)
 	if err != nil {
 		s.updateHistory(ctx, h, domain.BackupStatusFailed, err.Error())
-		return
+		return err
 	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
-		s.updateHistory(ctx, h, domain.BackupStatusFailed, fmt.Sprintf("Failed to open backup file: %v", err))
-		return
+		msg := fmt.Sprintf("Failed to open backup file: %v", err)
+		s.updateHistory(ctx, h, domain.BackupStatusFailed, msg)
+		return fmt.Errorf("open backup file: %w", err)
 	}
 	defer f.Close()
 
-	_, err = client.SendFile(fileName, f, "application/zip", startTime)
-	if err != nil {
-		s.updateHistory(ctx, h, domain.BackupStatusFailed, fmt.Sprintf("Upload failed: %v", err))
-		return
+	if _, err := client.SendFile(fileName, f, "application/zip", startTime); err != nil {
+		msg := fmt.Sprintf("Upload failed: %v", err)
+		s.updateHistory(ctx, h, domain.BackupStatusFailed, msg)
+		return fmt.Errorf("upload archive: %w", err)
 	}
 
 	s.updateHistory(ctx, h, domain.BackupStatusSuccess, "Success")
+	return nil
 }
 
 // syncFiles Sync file changes to specified storage target (supports add, modify, delete)
